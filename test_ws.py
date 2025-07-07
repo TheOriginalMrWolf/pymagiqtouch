@@ -15,20 +15,41 @@ from pymagiqtouch.client import MagiqTouchClient
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s - [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler()]
 )
 
 _LOGGER = logging.getLogger("ws_test")
 
 # Keep track of received messages
-received_messages = []
+# received_messages = []
+message_stats = {
+    'last_status_query_at': datetime.now(),
+    'last_received_at': datetime.now(),
+    'messages_received_count': 0,
+}
+max_allowed_server_inactivity_seconds = 120
+status_request_interval_seconds = 180
+
 
 def update_callback(data):
     """Callback function for WebSocket updates."""
-    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    _LOGGER.info("[%s] Received update: %s", timestamp, json.dumps(data)[:120] + "...")
-    received_messages.append(data)
+    _LOGGER.info("Received update: %s", json.dumps(data)[:120] + "...")
+    # received_messages.append(data)
+    message_stats['last_received_at'] = datetime.now()
+    message_stats['messages_received_count'] += 1
+
+
+def send_status_request(client: MagiqTouchClient, device_id: str|None):
+    if not device_id:
+        _LOGGER.warning("NOT sending status request - no device specified (--device-id not set)")
+        return
+    try:
+        _LOGGER.info("Sending status request for device: %s", device_id)
+        client.send({"action": "status", "params": {"device": device_id}})
+    except Exception as exc:
+        _LOGGER.error("Failed to send command: %r", exc)
+
 
 def parse_args():
     """Parse command line arguments."""
@@ -38,13 +59,14 @@ def parse_args():
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--duration", type=int, default=60,
                         help="Duration to keep the WebSocket open (seconds)")
-    parser.add_argument("--send-status", type=str, default=None,
+    parser.add_argument("--device-id", type=str, default=None,
                         help="Send status request for device ID (e.g., '90E202CADD0C')")
     parser.add_argument("--heartbeat", type=int, default=30,
                         help="Heartbeat interval in seconds")
     parser.add_argument("--connection-timeout", type=int, default=10,
                         help="Timeout for waiting for WebSocket connection (seconds)")
     return parser.parse_args()
+
 
 def main():
     """Run the WebSocket test."""
@@ -64,17 +86,10 @@ def main():
             heartbeat_interval=args.heartbeat
         )
 
-        # # First, authenticate manually to ensure it works
-        # if not client.auth.authenticate():
-        #     _LOGGER.error("❌ Authentication failed!")
-        #     return 1
-
-        # _LOGGER.info("✅ Authentication successful")
-        _LOGGER.info("WebSocket endpoint: %s", client.ws_endpoint)
-
         # Start the WebSocket client
         _LOGGER.info("Starting WebSocket client...")
         client.start()
+        _LOGGER.info("WebSocket endpoint: %s", client.ws_endpoint)
 
         # Wait for the WebSocket connection to be ready
         _LOGGER.info(f"Waiting up to {args.connection_timeout} seconds for connection...")
@@ -87,13 +102,7 @@ def main():
             _LOGGER.warning("⚠️ Timed out waiting for WebSocket connection")
 
         # Send a status request if specified
-        if args.send_status:
-            try:
-                server_command = {"action": "status", "params": {"device": args.send_status}}
-                client.send(server_command)
-                _LOGGER.info("Sent status request for device: %s", args.send_status)
-            except Exception as exc:
-                _LOGGER.error("Failed to send command: %r", exc)
+        send_status_request(client, args.device_id)
 
         # Calculate end time
         end_time = datetime.now() + timedelta(seconds=args.duration)
@@ -102,8 +111,10 @@ def main():
 
         # Main loop - keep running until duration expires
         try:
-            while datetime.now() < end_time:
-                remaining = (end_time - datetime.now()).total_seconds()
+            right_now = datetime.now()
+            while right_now < end_time:
+
+                remaining = (end_time - right_now).total_seconds()
                 if remaining <= 0:
                     break
 
@@ -111,10 +122,26 @@ def main():
                 sleep_time = min(1.0, remaining)
                 time.sleep(sleep_time)
 
+                # kick the server if if hasn't sent a message for more than the timeout
+                time_since_last_message = (right_now - message_stats['last_received_at']).total_seconds()
+                if time_since_last_message > max_allowed_server_inactivity_seconds:
+                    _LOGGER.info("No messages from server for %d seconds, restarting connection...", int(time_since_last_message))
+                    client.stop()
+                    time.sleep(3)
+                    client.start()
+                    # Reset last_message_received_at to avoid spamming
+                    message_stats['last_received_at'] = right_now
+
+                time_since_last_status_request = (right_now - message_stats["last_status_query_at"]).total_seconds()
+                if time_since_last_status_request > status_request_interval_seconds:
+                    send_status_request(client, args.device_id)
+                    message_stats["last_status_query_at"] = right_now
+
                 # Every 15 seconds, show how many messages we've received
                 if int(remaining) % 15 == 0 and int(remaining) != int(remaining + sleep_time):
-                    _LOGGER.info("[%s] Received %d message(s) so far, %d seconds remaining", datetime.now().strftime("%H:%M:%S.%f")[:-3],
-                                len(received_messages), int(remaining))
+                    _LOGGER.info("Received %d message(s) so far, %d seconds remaining", message_stats["messages_received_count"], int(remaining))
+
+                right_now = datetime.now()
 
         except KeyboardInterrupt:
             _LOGGER.info("Test interrupted by user")
@@ -123,12 +150,14 @@ def main():
         _LOGGER.info("Stopping WebSocket client...")
         client.stop()
 
-        _LOGGER.info("Test completed. Received %d total messages", len(received_messages))
+        _LOGGER.info("Test completed. Received %d total messages", message_stats["messages_received_count"])
         return 0
 
     except Exception as exc:
         _LOGGER.error("Test failed with error: %r", exc)
         return 1
+
+
 
 if __name__ == "__main__":
     sys.exit(main())
