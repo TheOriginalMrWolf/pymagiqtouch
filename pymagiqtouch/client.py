@@ -6,8 +6,7 @@ import asyncio
 import threading
 import json
 import logging
-import time
-from typing import Any, Dict, Optional, Union, ByteString, cast
+from typing import Any, Dict, Optional, Union
 
 import requests
 import aiohttp
@@ -135,8 +134,8 @@ class MagiqTouchClient:
         try:
             while not self._stop_event.is_set():
                 try:
-                    # Authenticate before connecting
-                    if not self.auth.ensure_authenticated():
+                    # Authenticate first if necessary
+                    if not await self.auth.ensure_valid_token():
                         self.logger.error("Authentication failed, retrying...")
                         await self._delay_retry()
                         continue
@@ -152,9 +151,11 @@ class MagiqTouchClient:
                     self.logger.warning("WebSocket error: %r. Reconnecting after delay.", exc)
                     await self._delay_retry()
         finally:
-            # Clean up the session when exiting
+            # Clean up the session when exiting - this should always happen
             if hasattr(self, 'httpsession') and self.httpsession is not None:
+                self.logger.debug("Closing HTTP session in _run_forever finally block")
                 await self.httpsession.close()
+                self.httpsession = None
 
     async def _delay_retry(self):
         """Wait before retrying connection, using exponential backoff."""
@@ -194,17 +195,14 @@ class MagiqTouchClient:
             "sec-websocket-protocol": "wasp"
         }
 
-        session_created = False
         heartbeat_task = None
 
         try:
-            # Create session if needed
+            # Fix: Check if session exists before using it
             if not hasattr(self, 'httpsession') or self.httpsession is None:
-                self.logger.debug("Creating new aiohttp ClientSession")
-                self.httpsession = aiohttp.ClientSession()
-                session_created = True
+                self.logger.error("No HTTP session available for WebSocket connection")
+                return
 
-            # Use aiohttp to connect to WebSocket
             async with self.httpsession.ws_connect(
                 url,
                 headers=headers,
@@ -224,11 +222,9 @@ class MagiqTouchClient:
                 # Start heartbeat task
                 heartbeat_task = asyncio.create_task(self._heartbeat(ws))
 
-                connected_time = time.time()
-
                 # Process incoming messages
                 async for msg in ws:
-                    # Handle different message types like the original
+                    # Handle different message types
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         # Process text messages
                         self._handle_message(msg.data)
@@ -242,7 +238,7 @@ class MagiqTouchClient:
                         break
 
                     elif msg.type in (aiohttp.WSMsgType.PING, aiohttp.WSMsgType.PONG):
-                        self.logger.info("Ping/Pong: %s", msg.type)
+                        self.logger.debug("Ping/Pong: %s", msg.type)
 
                     elif msg.type == aiohttp.WSMsgType.ERROR:
                         self.logger.warning("WebSocket error: %s", msg)
@@ -250,9 +246,9 @@ class MagiqTouchClient:
                     else:
                         self.logger.warning("Unexpected WebSocket message: %s", msg)
 
-                    # Check if we need to refresh the token (45 minutes)
-                    if (time.time() - connected_time) > (45 * 60):
-                        self.logger.info("Token nearing expiry, reconnecting")
+                    # Check if we need to refresh the token
+                    if self.auth.is_token_expired():
+                        self.logger.info("Token expired, reconnecting")
                         break
 
                     if self._stop_event.is_set():
@@ -280,16 +276,6 @@ class MagiqTouchClient:
             with self._lock:
                 self._ws = None
 
-            # Clean up the session if we created it in this method
-            if session_created and hasattr(self, 'httpsession') and self.httpsession is not None:
-                try:
-                    await self.httpsession.close()
-                    self.httpsession = None
-                    self.logger.debug("Closed aiohttp ClientSession after connection")
-                except Exception as close_exc:
-                    self.logger.warning("Failed to close aiohttp ClientSession: %r", close_exc)
-
-
     def _get_authenticated_ws_url(self, base_url: str) -> str:
         """Add authentication to WebSocket URL.
 
@@ -299,9 +285,11 @@ class MagiqTouchClient:
         Returns:
             str: WebSocket URL with authentication token
         """
-        # Extract token from auth params
-        auth_params = self.auth.ws_auth_params
-        token = auth_params.get('token', '')
+        # Get token directly from auth
+        token = self.auth.get_id_token()
+        if not token:
+            self.logger.error("No ID token available for WebSocket connection")
+            raise RuntimeError("No authentication token available")
 
         # Convert https:// to wss:// (secure websocket) or http:// to ws://
         if base_url.startswith('https://'):
@@ -310,7 +298,9 @@ class MagiqTouchClient:
             base_url = 'ws://' + base_url[7:]
 
         # Simply append the token to the URL as in the original implementation
-        return base_url + token
+        authenticated_url = base_url + token
+        self.logger.debug("WebSocket URL with token: %s", authenticated_url[:120] + "...")
+        return authenticated_url
 
     async def _shutdown(self):
         """Shut down the WebSocket connection cleanly."""
@@ -373,7 +363,7 @@ class MagiqTouchClient:
             try:
                 await asyncio.sleep(600)  # Check every 10 minutes
                 self.logger.debug("Performing auth keepalive check")
-                if not self.auth.ensure_authenticated():
+                if not await self.auth.ensure_valid_token():
                     self.logger.warning("Auth token refresh failed, reconnecting...")
                     await self._reconnect_with_fresh_auth()
             except asyncio.CancelledError:
@@ -413,7 +403,7 @@ class MagiqTouchClient:
         return self._ws_url
 
 
-# REST Client implementation remains unchanged
+# REST Client implementation
 class MagiqTouchRestClient:
     """REST API wrapper for MagiqTouch server with authentication."""
 

@@ -80,6 +80,9 @@ def main():
         _LOGGER.info(f"Waiting up to {args.connection_timeout} seconds for connection...")
         if client.connection_ready.wait(timeout=args.connection_timeout):
             _LOGGER.info("✅ WebSocket connection established")
+            # Show token status for debugging
+            token_status = client.auth.get_token_status()
+            _LOGGER.info("Token status: %s", {k: v for k, v in token_status.items() if k in ['access_token_expires_in', 'refresh_token_expires_in']})
         else:
             _LOGGER.warning("⚠️ Timed out waiting for WebSocket connection")
 
