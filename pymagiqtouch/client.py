@@ -80,12 +80,40 @@ class MagiqTouchClient:
         self.logger.debug("Started thread: %s", self._thread)
 
     def stop(self):
-        """Stop the WebSocket client and close connection."""
+        """Blocking: stop the WebSocket client and close connection."""
         self._stop_event.set()
-        if self._loop:
-            asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
+        if self._loop and self._loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
+            try:
+                future.result(timeout=5)
+            except Exception as e:
+                self.logger.warning("Error waiting for shutdown - coroutine error: %s", e)
+
+        self._cleanup()
+
+    async def async_stop(self):
+        self._stop_event.set()
+        if self._loop and self._loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
+            try:
+                await asyncio.wrap_future(future)
+            except Exception as e:
+                self.logger.warning("Shutdown error: %s", e)
+        self._cleanup()
+
+
+    def _cleanup(self):
+        # if the thread is still hanging around give it another while to shut
+        # down gracefully before slamming the door.
         if self._thread:
             self._thread.join(timeout=10)
+
+        self._ws = None
+        self._loop = None
+        self._thread = None
+        self._keepalive_task = None
+        self._retry_attempts = 0
+        self._stop_event.clear()
 
     def send(self, message: Dict[str, Any]):
         """Send a message to the server (JSON dict). Thread-safe.
@@ -119,10 +147,15 @@ class MagiqTouchClient:
     def _run_loop(self):
         """Run the event loop in a background thread."""
         self.logger.debug("Setting up event loop in background thread")
-        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+        # Avoid global policy bombing
+        # asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._run_forever())
+        try:
+            self._loop.run_until_complete(self._run_forever())
+        finally:
+            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            self._loop.close()
 
     async def _run_forever(self):
         """Run the WebSocket client forever, reconnecting as needed."""
