@@ -127,9 +127,12 @@ def main():
                 if time_since_last_message > max_allowed_server_inactivity_seconds:
                     _LOGGER.info("No messages from server for %d seconds, restarting connection...", int(time_since_last_message))
                     client.stop()
-                    time.sleep(3)
+                    _LOGGER.info("Old connection terminated, starting new connection...")
                     client.start()
+                    _LOGGER.info("Done")
+
                     # Reset last_message_received_at to avoid spamming
+                    # Good place for some sort of exponential backoff retry mechanism
                     message_stats['last_received_at'] = right_now
 
                 time_since_last_status_request = (right_now - message_stats["last_status_query_at"]).total_seconds()
